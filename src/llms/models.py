@@ -23,6 +23,8 @@ class Model(str, Enum):
     gemini_2_5 = "gemini-2.5-pro"
     gemini_2_5_flash_lite = "gemini-2.0-flash-lite"
     gemini_3_pro = "gemini-3-pro-preview"
+    gemini_3_pro_gateway = "gateway/google-vertex:gemini-3-pro-preview"
+    gemini_3_pro_openrouter = "google/gemini-3-pro-preview"
 
     deepseek_chat = "deepseek-chat"
     deepseek_reasoner = "deepseek-reasoner"
@@ -72,4 +74,6 @@ model_config: dict[Model, ModelConfig] = {
     Model.gpt_5: ModelConfig(max_tokens=1_000_000, max_thinking_tokens=None),
     Model.gpt_5_pro: ModelConfig(max_tokens=4_000_000, max_thinking_tokens=None),
     Model.gemini_3_pro: ModelConfig(max_tokens=1_000_000, max_thinking_tokens=65_535),
+    Model.gemini_3_pro_gateway: ModelConfig(max_tokens=1_000_000, max_thinking_tokens=32_768),  # Vertex AI limit
+    Model.gemini_3_pro_openrouter: ModelConfig(max_tokens=1_048_576, max_thinking_tokens=None),  # OpenRouter manages this
 }

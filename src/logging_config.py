@@ -24,11 +24,9 @@ logging.getLogger("opentelemetry.exporter.otlp").setLevel(logging.ERROR)
 
 
 def scrubbing_callback(m: logfire.ScrubMatch):
-    if (
-        m.path == ("attributes", "error_message")
-        and m.pattern_match.group(0) == "API key"
-    ):
-        return m.value
+    # Disable all scrubbing - return the original value for everything
+    # This lets us see full error messages including auth errors, cookies, etc.
+    return m.value
 
 
 # Initialize Logfire with the API key from env

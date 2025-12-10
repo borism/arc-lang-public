@@ -12,6 +12,10 @@ from devtools import debug
 from google import genai
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+import httpx
+from pydantic_ai.providers.gateway import gateway_provider
 from xai_sdk import AsyncClient as XaiAsyncClient
 from xai_sdk.chat import assistant, image, system, user
 
@@ -75,6 +79,9 @@ def retry_with_backoff(
                         or "Empty response from OpenRouter model" in msg
                         or "validation error" in msg
                         or "SAFETY_CHECK_TYPE_BIO" in msg
+                        or "524" in msg  # Cloudflare timeout
+                        or "timeout" in msg.lower()
+                        or "ServerError" in msg
                     )
                     if "StatusCode.DEADLINE_EXCEEDED" in msg:
                         retryable = False
@@ -200,6 +207,10 @@ async def get_next_structure(
                 res = await _get_next_structure_gemini(
                     structure=structure, model=model, messages=messages
                 )
+            elif model in [Model.gemini_3_pro_gateway]:
+                res = await _get_next_structure_pydantic_gateway(
+                    structure=structure, model=model, messages=messages
+                )
             elif model in [
                 Model.openrouter_sonnet_3_7_thinking,
                 Model.openrouter_sonnet_3_7,
@@ -219,6 +230,7 @@ async def get_next_structure(
                 Model.openrouter_grok_4,
                 Model.openrouter_horizon_alpha,
                 Model.openrouter_gpt_oss_120b,
+                Model.gemini_3_pro_openrouter,
             ]:
                 res = await _get_next_structure_openrouter(
                     structure=structure, model=model, messages=messages
@@ -480,6 +492,18 @@ MODEL_PRICING_D: dict[Model, ModelPricing] = {
         prompt_tokens=2_500 / 1_000_000,  # $2.50 per 1M tokens (estimate)
         reasoning_tokens=15_000 / 1_000_000,  # $15 per 1M tokens (thinking, estimate)
         completion_tokens=15_000 / 1_000_000,  # $15 per 1M tokens (estimate)
+    ),
+    # Pydantic AI Gateway - same pricing as direct, gateway is free during beta
+    Model.gemini_3_pro_gateway: ModelPricing(
+        prompt_tokens=2_500 / 1_000_000,  # $2.50 per 1M tokens (estimate)
+        reasoning_tokens=15_000 / 1_000_000,  # $15 per 1M tokens (thinking, estimate)
+        completion_tokens=15_000 / 1_000_000,  # $15 per 1M tokens (estimate)
+    ),
+    # OpenRouter Gemini 3 Pro - $2/M input, $12/M output (from OpenRouter)
+    Model.gemini_3_pro_openrouter: ModelPricing(
+        prompt_tokens=2_000 / 1_000_000,  # $2 per 1M tokens
+        reasoning_tokens=0 / 1_000_000,  # OpenRouter doesn't charge separately for reasoning
+        completion_tokens=12_000 / 1_000_000,  # $12 per 1M tokens
     ),
 }
 
@@ -803,6 +827,14 @@ async def _get_next_structure_openrouter(
             "allow_fallbacks": False,
             "only": ["Cerebras", "Groq"],
         }
+    elif model == Model.gemini_3_pro_openrouter:
+        # Gemini 3 Pro via OpenRouter - force Google provider, enable reasoning
+        extra_body["provider"] = {
+            "only": ["Google"],
+            "allow_fallbacks": False,
+        }
+        # OpenRouter's reasoning parameter for thinking models
+        extra_body["reasoning"] = {"effort": "high"}
     else:
         # Default: sort by throughput for all other OpenRouter models
         extra_body["provider"] = {
@@ -912,6 +944,112 @@ async def _get_next_structure_gemini(
         return output
     except json.JSONDecodeError as e:
         raise Exception(f"Failed to parse JSON response: {e}\nResponse: {content}")
+
+
+def update_messages_pydantic_ai(messages: list[dict]) -> str:
+    """Convert messages to a single prompt string for Pydantic AI Agent.run()."""
+    parts = []
+
+    for message in messages:
+        role = message["role"]
+
+        if isinstance(message["content"], list):
+            # Handle structured content format (OpenAI-style)
+            text_parts = []
+            for c in message["content"]:
+                if c["type"] in ["input_text", "output_text", "text"]:
+                    text_parts.append(c.get("text", c.get("content", "")))
+            content = " ".join(text_parts)
+        else:
+            content = message["content"]
+
+        if role == "system":
+            parts.append(f"System: {content}")
+        elif role == "user":
+            parts.append(f"User: {content}")
+        elif role == "assistant":
+            parts.append(f"Assistant: {content}")
+
+    return "\n\n".join(parts)
+
+
+# Pydantic AI Gateway settings for Gemini models (Vertex AI limits)
+# Vertex AI has different limits than direct Gemini API: thinking_budget 1-32768
+PYDANTIC_GATEWAY_THINKING_BUDGET: dict[Model, int] = {
+    Model.gemini_3_pro_gateway: 32_768,  # Max for Vertex AI
+}
+
+PYDANTIC_GATEWAY_MAX_TOKENS: dict[Model, int] = {
+    Model.gemini_3_pro_gateway: 65_536,  # Max output tokens
+}
+
+
+@retry_with_backoff(max_retries=20)
+async def _get_next_structure_pydantic_gateway(
+    structure: type[BMType],
+    model: Model,
+    messages: list,
+) -> BMType:
+    """
+    Use Pydantic AI Gateway to call Gemini models with native thinking_config support.
+    Requires PYDANTIC_AI_GATEWAY_API_KEY environment variable.
+    """
+    # Build model settings with thinking config
+    thinking_budget = PYDANTIC_GATEWAY_THINKING_BUDGET.get(model, 65_535)
+    max_tokens = PYDANTIC_GATEWAY_MAX_TOKENS.get(model, 65_536)
+
+    settings = GoogleModelSettings(
+        max_tokens=max_tokens,
+        google_thinking_config={"thinking_budget": thinking_budget},
+    )
+
+    # Create gateway provider with explicit API key
+    # Support both env var names
+    gateway_api_key = os.environ.get("PYDANTIC_AI_GATEWAY_API_KEY") or os.environ.get("PYDANTIC_API_GATEWAY_API_KEY")
+    if not gateway_api_key:
+        raise ValueError("Set PYDANTIC_AI_GATEWAY_API_KEY or PYDANTIC_API_GATEWAY_API_KEY environment variable")
+    
+    # Create custom HTTP client with long timeout for reasoning models (3 hours like GPT-5-Pro)
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(10_800.0))
+    
+    # gateway_provider takes upstream provider as string (e.g., "google-vertex")
+    gateway = gateway_provider("google-vertex", api_key=gateway_api_key, http_client=http_client)
+
+    # Extract model name from the gateway path (e.g., "gateway/google-vertex:gemini-3-pro-preview" -> "gemini-3-pro-preview")
+    model_name = model.value.split(":")[-1]
+    google_model = GoogleModel(model_name, provider=gateway)
+
+    # Create agent with structured output type
+    agent: Agent[None, BMType] = Agent(
+        google_model,
+        output_type=structure,
+        model_settings=settings,
+    )
+
+    # Convert messages to prompt string
+    prompt = update_messages_pydantic_ai(messages)
+
+    # Run the agent
+    result = await agent.run(prompt)
+
+    # Log usage if available
+    usage = result.usage()
+    if usage:
+        gemini_usage = GeminiUsage(
+            prompt_tokens=usage.request_tokens or 0,
+            completion_tokens=usage.response_tokens or 0,
+            total_tokens=usage.total_tokens or 0,
+            thinking_tokens=0,  # Pydantic AI doesn't expose thinking tokens separately yet
+            cached_tokens=0,
+        )
+        log.debug(
+            "pydantic_gateway_usage",
+            model=model.value,
+            usage=gemini_usage.model_dump(),
+            cents=gemini_usage.cents(model=model),
+        )
+
+    return result.output
 
 
 async def main_test() -> None:
